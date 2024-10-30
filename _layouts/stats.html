@@ -55,6 +55,9 @@ layout: default
   </div>
 </div>
 
+<!--
+Adapted from https://github.com/benfred/venn.js/blob/master/examples/intersection_tooltip.html
+ -->
 <style>
 .venn {
   font-family: "Helvetica Neue",Helvetica,Arial,sans-serif;
@@ -74,15 +77,15 @@ layout: default
 }
 </style>
 
-<script src="https://d3js.org/d3.v2.min.js"></script>
-<script src="{{site.baseurl}}/js/venn.js/venn.js"></script>
+<script src="https://d3js.org/d3.v6.min.js"></script>
+<script src="{{site.baseurl}}/js/venn.js"></script>
 <script src="{{site.baseurl}}/js/mds.js"></script>
-<script src="{{site.baseurl}}/js/numeric-1.2.6.js"></script>
+<script src="{{site.baseurl}}/js/numeric.js"></script>
 <script>
 // define sets and set set intersections
 var sets = [
     {% for distro in page.distro_counts %}
-      {label: "{{distro[0]}}", size: {{distro[1]}}},
+      {sets: ["{{distro[0]}}"], size: {{distro[1]}}},
     {% endfor %}
   ],
   overlaps = [
@@ -90,81 +93,51 @@ var sets = [
       {sets: {{ol[0]}}, size: {{ol[1]}}},
     {% endfor %}
   ];
-
-// get positions for each set
-sets = venn.venn(sets, overlaps, {layoutFunction: venn.classicMDSLayout});
+  sets = sets.concat(overlaps);
 
 // draw the diagram in the 'venn' div
-var diagram = venn.drawD3Diagram(d3.select(".venn"), sets, 500, 300);
+var diagram = venn.VennDiagram();
+var div = d3.select(".venn")
+div.datum(sets).call(diagram);
 
 // add a tooltip showing the size of each set/intersection
 var tooltip = d3.select("body").append("div")
     .attr("class", "venntooltip");
 
-d3.selection.prototype.moveParentToFront = function() {
-  return this.each(function(){
-    this.parentNode.parentNode.appendChild(this.parentNode);
-  });
-};
+div.selectAll("path")
+  .style("stroke-opacity", 0)
+  .style("stroke", "#fff")
+  .style("stroke-width", 3)
 
-// hover on all the circles
-diagram.circles
-    .style("stroke-opacity", 0)
-    .style("stroke", "white")
-    .style("stroke-width", "2");
+// add listeners to all the groups to display tooltip on mouseover
+div.selectAll("g")
+    .on("mouseover", function(event, d) {
+        // sort all the areas relative to the current item
+        venn.sortAreas(div, d);
 
-diagram.nodes
-    .on("mousemove", function() {
-        tooltip.style("left", (d3.event.pageX) + "px")
-               .style("top", (d3.event.pageY - 28) + "px");
-    })
-    .on("mouseover", function(d, i) {
-        var selection = d3.select(this).select("circle");
-        selection.moveParentToFront()
-            .transition()
-            .style("fill-opacity", .5)
-            .style("stroke-opacity", 1);
-
-        tooltip.transition().style("opacity", .9);
+        // Display a tooltip with the current size
+        tooltip.transition().duration(400).style("opacity", .9);
         tooltip.text(d.size + " packages");
+
+        // highlight the current path
+        var selection = d3.select(this).transition("tooltip").duration(400);
+        selection.select("path")
+            .style("fill-opacity", d.sets.length == 1 ? .4 : .1)
+            .style("stroke-opacity", 1);
     })
-    .on("mouseout", function(d, i) {
-        d3.select(this).select("circle").transition()
-            .style("fill-opacity", .3)
+
+    .on("mousemove", function(event) {
+        tooltip.style("left", (event.pageX) + "px")
+               .style("top", (event.pageY - 28) + "px");
+    })
+
+    .on("mouseout", function(event, d) {
+        tooltip.transition().duration(400).style("opacity", 0);
+        var selection = d3.select(this).transition("tooltip").duration(400);
+        selection.select("path")
+            .style("fill-opacity", d.sets.length == 1 ? .25 : .0)
             .style("stroke-opacity", 0);
-        tooltip.transition().style("opacity", 0);
     });
-
-// draw a path around each intersection area, add hover there as well
-diagram.svg.selectAll("path")
-    .data(overlaps)
-    .enter()
-    .append("path")
-    .attr("d", function(d) {
-        return venn.intersectionAreaPath(d.sets.map(function(j) { return sets[j]; }));
-    })
-    .style("fill-opacity","0")
-    .style("fill", "black")
-    .style("stroke-opacity", 0)
-    .style("stroke", "white")
-    .style("stroke-width", "2")
-    .on("mouseover", function(d, i) {
-        d3.select(this).transition()
-            .style("fill-opacity", .1)
-            .style("stroke-opacity", 1);
-        tooltip.transition().style("opacity", .9);
-        tooltip.text(d.size + " packages");
-    })
-    .on("mouseout", function(d, i) {
-        d3.select(this).transition()
-            .style("fill-opacity", 0)
-            .style("stroke-opacity", 0);
-        tooltip.transition().style("opacity", 0);
-    })
-    .on("mousemove", function() {
-        tooltip.style("left", (d3.event.pageX) + "px")
-               .style("top", (d3.event.pageY - 28) + "px");
-    })
 </script>
 
 <style>
@@ -210,58 +183,62 @@ function makeHist(selector, values) {
       height = 150 - margin.top - margin.bottom;
 
   var max_age = 2000;
-  var x = d3.scale.linear()
+  var x = d3.scaleLinear()
       .domain([1, max_age])
       .range([0, width]);
 
-  // Generate a histogram using twenty uniformly-spaced bins.
-  var data = d3.layout.histogram()
-      .bins(x.ticks(30))
-      (values);
+  // Generate a histogram using thirty uniformly-spaced bins.
+  var histogram = d3.histogram()
+      .domain(x.domain())
+      .thresholds(x.ticks(30))
+  var data  = histogram(values)
 
-  var y = d3.scale.linear()
-      .domain([0, d3.max(data, function(d) { return d.y; })])
+  var y = d3.scaleLinear()
+      .domain([0, d3.max(data, function(d) { return d.length || 1; })])
       .range([height, 0]);
 
-  var xAxis = d3.svg.axis()
-      .scale(x)
-      .orient("bottom");
+  var xAxis = d3.axisBottom()
+      .scale(x);
 
   var svg = d3.select(selector).append("svg")
       .attr("width", width + margin.left + margin.right)
       .attr("height", height + margin.top + margin.bottom)
     .append("g")
-      .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+      .attr("transform", function(d) {
+        return "translate(" + margin.left + "," + margin.top + ")";
+      });
 
   var bar = svg.selectAll(".bar")
       .data(data)
     .enter().append("g")
       .attr("class", "bar")
-      .attr("transform", function(d) { return "translate(" + x(d.x) + "," + y(d.y) + ")"; });
+      .attr("transform", function(d) { return "translate(" + x(d.x0) + "," + y(d.length) + ")"; });
 
   var tooltip = d3.select("body").append("div")
     .attr("class", "histtooltip");
 
   bar.append("rect")
       .attr("x", 1)
-      .attr("width", function(d) { return x(d.dx) - 1; })
-      .attr("height", function(d) { return height - y(d.y); })
-      .on("mouseover", function(d, i) {
+      .attr("width", function(d) { return x(d.x1) - x(d.x0)- 1; })
+      .attr("height", function(d) { 
+        return height - y(d.length); 
+      })
+      .on("mouseover", function(event, d) {
           d3.select(this).transition()
           .style("fill-opacity", .1)
           .style("stroke-opacity", 1);
           tooltip.transition().style("opacity", .9);
-          tooltip.text(d.y);
+          tooltip.text(d.length);
           })
-      .on("mouseout", function(d, i) {
+      .on("mouseout", function(event, d) {
           d3.select(this).transition()
           .style("fill-opacity", 1)
           .style("stroke-opacity", 0);
           tooltip.transition().style("opacity", 0);
       })
-      .on("mousemove", function() {
-          tooltip.style("left", (d3.event.pageX) + "px")
-                 .style("top", (d3.event.pageY - 28) + "px");
+      .on("mousemove", function(event) {
+          tooltip.style("left", (event.pageX) + "px")
+                 .style("top", (event.pageY - 28) + "px");
       });
 
       /*

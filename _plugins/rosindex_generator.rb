@@ -27,6 +27,7 @@ require_relative '../_ruby_libs/pages'
 require_relative '../_ruby_libs/asset_parsers'
 require_relative '../_ruby_libs/roswiki'
 require_relative '../_ruby_libs/lunr'
+require_relative '../_ruby_libs/dependency_descriptions'
 
 $fetched_uris = {}
 $debug = false
@@ -159,10 +160,10 @@ class Indexer < Jekyll::Generator
           next
         end
 
-        puts "Updating repo / instance "+repo.name+" / "+repo.id+" from uri: "+repo.uri
-
         # open or initialize this repo
         local_path = File.join(@checkout_path, repo_instances.name, id)
+
+        puts "Updating repo / instance "+repo.name+" / "+repo.id+" from uri: "+repo.uri+" into path: "+local_path
 
         # make sure there's an actual uri
         unless repo.uri
@@ -229,7 +230,19 @@ class Indexer < Jekyll::Generator
   def get_ci_data(distro, package_name, repo_name)
     ci_data = Hash.new
     manifest_url = "/#{DEFAULT_LANGUAGE_PREFIX}/#{distro}/api/#{package_name}/manifest.yaml"
-    manifest_response = Net::HTTP.get_response('docs.ros.org', manifest_url)
+    begin
+      manifest_response = Net::HTTP.get_response('docs.ros.org', manifest_url)
+    rescue StandardError => e
+      puts " Failed to fetch manifest from #{manifest_url} with error #{e.class}"
+      ci_data['tooltip'] = 'Error fetching CI information available for this package.'
+      ci_data['ci_available'] = false
+      return ci_data
+    rescue
+      puts " Failed to fetch manifest from #{manifest_url} with unknown error"
+      ci_data['tooltip'] = 'Error fetching CI information available for this package.'
+      ci_data['ci_available'] = false
+      return ci_data
+    end
     if manifest_response.code != '200'
       ci_data['tooltip'] = 'No CI information available for this package.'
       ci_data['ci_available'] = false
@@ -250,7 +263,15 @@ class Indexer < Jekyll::Generator
     ci_data['job_url'] = manifest_yaml['devel_jobs'][0]
     # get additional test information if available
     results_url = "/#{DEFAULT_LANGUAGE_PREFIX}/#{distro}/devel_jobs/#{repo_name}/results.yaml"
-    results_response = Net::HTTP.get_response('docs.ros.org', results_url)
+    begin
+      results_response = Net::HTTP.get_response('docs.ros.org', results_url)
+    rescue
+      ci_data['tooltip'] = "Latest build information: " + ci_data['timestamp'] + "\n" \
+        'No test statistics available for this package.'
+      ci_data['result'] = 'success'
+      ci_data['stats_available'] = false
+      return ci_data
+    end
     if results_response.code != '200'
       ci_data['tooltip'] = "Latest build information: " + ci_data['timestamp'] + "\n" \
         'No test statistics available for this package.'
@@ -803,7 +824,22 @@ class Indexer < Jekyll::Generator
     return rosdep_data
   end
 
-  def generate_sorted_paginated(site, elements_sorted, default_sort_key, n_elements, elements_per_page, page_class)
+  def generate_sorted_paginated_deps(site, elements_sorted, default_sort_key, n_elements, elements_per_page, page_class)
+
+    n_pages = (n_elements / elements_per_page).floor + 1
+
+    (1..n_pages).each do |page_index|
+      p_start = (page_index-1) * elements_per_page
+      elements_sliced = elements_sorted.slice(p_start, elements_per_page)
+      site.pages << page_class.new(site, default_sort_key, n_pages, page_index, elements_sliced)
+      # create page 1 without a page number or key in the url
+      if page_index == 1
+        site.pages << page_class.new(site, default_sort_key, n_pages, page_index, elements_sliced, true)
+      end
+    end
+  end
+
+def generate_sorted_paginated(site, elements_sorted, default_sort_key, n_elements, elements_per_page, page_class)
 
     n_pages = (n_elements / elements_per_page).floor + 1
 
@@ -916,11 +952,6 @@ class Indexer < Jekyll::Generator
     return packages_sorted
   end
 
-  def sort_rosdeps(site)
-    sorted_rosdeps = @rosdeps.sort_by { |name, _| name }
-    return {'name' => Hash[$all_distros.collect {|distro| [distro, sorted_rosdeps]}] }
-  end
-
   def write_release_manifests(site, repo, package_name, default)
     $all_distros.each do |distro|
       unless repo.release_manifests[distro].nil?
@@ -1004,9 +1035,12 @@ class Indexer < Jekyll::Generator
       site.data['common']['platforms'],
       site.data['common']['package_manager_names'].keys)
 
+    debian_descriptions = get_debian_descriptions()
+ 
     raw_rosdeps.each do |dep_name, dep_data|
       platforms = site.data['common']['platforms']
       manager_set = Set.new(site.data['common']['package_manager_names'])
+      description = ""
 
       platform_data = {}
       platforms.each do |platform_key, platform_details|
@@ -1015,12 +1049,28 @@ class Indexer < Jekyll::Generator
           platform_details['versions'].each do |version_key, version_name|
             platform_data[platform_key][version_key] = resolve_dep(platforms, manager_set, platform_key, version_key, dep_data)
           end
+          # Get dep description from debian
+          if platform_key == 'debian' and platform_data[platform_key].has_key?('bullseye')
+            platform_data[platform_key]['bullseye'].each do |debian_key|
+              # zero-length debian_descriptions indicates a failed download
+              if debian_descriptions.length > 0
+                if debian_descriptions.has_key?(debian_key)
+                  description = debian_descriptions[debian_key]
+                  break
+                end
+              elsif site.config['use_db_cache'] and
+                  @rosdeps.has_key? dep_name and
+                  @rosdeps[dep_name].has_key? 'description'
+                description = @rosdeps[dep_name]['description']
+                break
+              end
+            end
+          end
         else
           platform_data[platform_key] = resolve_dep(platforms, manager_set, platform_key, 'any_version', dep_data)
         end
       end
-
-      @rosdeps[dep_name] = {'data_per_platform' => platform_data, 'dependants_per_distro' => {}}
+      @rosdeps[dep_name] = {'data_per_platform' => platform_data, 'dependants_per_distro' => {}, 'description' => description}
     end
 
     # get the repositories from the rosdistro files, rosdoc rosinstall files, and other sources
@@ -1457,16 +1507,19 @@ class Indexer < Jekyll::Generator
     packages_sorted = sort_packages(site)
     generate_sorted_paginated(site, packages_sorted, 'time', @package_names.length, site.config['packages_per_page'], PackageListPage)
 
-    # create rosdep list pages
-    puts ("Generating rosdep list pages...").blue
+    # create rosdep pages
+    puts ("Generating rosdep pages...").blue
 
     @rosdeps.each do |dep_name, full_dep_data|
       site.pages << DepPage.new(site, dep_name, raw_rosdeps[dep_name], full_dep_data)
     end
 
-    rosdeps_sorted = sort_rosdeps(site)
-    generate_sorted_paginated(site, rosdeps_sorted, 'name', @rosdeps.length, site.config['packages_per_page'], DepListPage)
-
+    # create rosdep list pages
+    puts ("Generating rosdep list pages...").blue
+  
+    rosdeps_sorted = @rosdeps.sort_by { |name, _| name }
+    generate_sorted_paginated_deps(site, rosdeps_sorted, 'name', @rosdeps.length, site.config['packages_per_page'], DepListPage)
+  
     # create contribution suggestions list pages
     puts ("Generating contribution suggestions list page...").blue
 
@@ -1477,8 +1530,12 @@ class Indexer < Jekyll::Generator
     unless site.config['skip_search_index']
       puts ("Generating packages search index...").blue
 
-      packages_index = []
+      packages_index = {}
+      $all_distros.each do |distro|
+        packages_index[distro] = []
+      end
 
+      index = 0
       @all_repos.each do |instance_id, repo|
         repo.snapshots.each do |distro, repo_snapshot|
 
@@ -1492,8 +1549,9 @@ class Indexer < Jekyll::Generator
 
             readme_filtered = if p['readme'] then self.strip_stopwords(p['readme']) else "" end
 
-            packages_index << {
-              'id' => packages_index.length,
+            index += 1
+            packages_index[distro] << {
+              'id' => index,
               'baseurl' => site.config['baseurl'],
               'url' => File.join('/p',package_name,instance_id)+"#"+distro,
               'last_commit_time' => repo_snapshot.data['last_commit_time'],
@@ -1503,7 +1561,7 @@ class Indexer < Jekyll::Generator
               'released' => if repo_snapshot.released then 'is:released' else '' end,
               'unreleased' => if repo_snapshot.released then 'is:unreleased' else '' end,
               'version' => p['version'],
-              'description' => p['description'],
+              'description' => p['description'].strip,
               'maintainers' => p['maintainers'] * " ",
               'authors' => p['authors'] * " ",
               'distro' => distro,
@@ -1516,10 +1574,6 @@ class Indexer < Jekyll::Generator
         end
       end
 
-      sorted_packages_index = packages_index.sort do |a, b|
-        $all_distros.index(a['distro']) <=> $all_distros.index(b['distro'])
-      end
-
       puts ("Precompiling lunr index for packages...").blue
       reference_field = 'id'
       indexed_fields = [
@@ -1528,8 +1582,8 @@ class Indexer < Jekyll::Generator
         'distro','readme', 'released', 'unreleased'
       ]
       site.static_files.push(*precompile_lunr_index(
-        site, sorted_packages_index, reference_field, indexed_fields,
-        "search/packages/", site.config['search_index_shards'] || 1
+        site, packages_index, reference_field, indexed_fields,
+        "search/packages/", $all_distros
       ).to_a)
 
       puts ("Generating system dependencies search index...").blue
@@ -1580,9 +1634,12 @@ class Indexer < Jekyll::Generator
       puts ("Precompiling lunr index for system dependencies...").blue
       reference_field = 'id'
       indexed_fields = ['name', 'platforms', 'dependants']
+      slice_length = system_deps_index.length / site.config['search_index_shards'] || 1
+      slices = {}
+      system_deps_index.each_slice(slice_length).with_index.map { |item, i| slices[i.to_s] = item }
       site.static_files.push(*precompile_lunr_index(
-        site, system_deps_index, reference_field, indexed_fields,
-        "search/deps/", site.config['search_index_shards'] || 1
+        site, slices, reference_field, indexed_fields,
+        "search/deps/", slices.keys
       ).to_a)
     end
 
@@ -1593,6 +1650,14 @@ class Indexer < Jekyll::Generator
     # create errors page
     puts "Generating errors page...".blue
     site.pages << ErrorsPage.new(site, @errors)
+
+    # remove symlinks in js to workaround issue #422
+    Dir.glob(File.join(site.dest, 'js', '*.js')) do |filename|
+       File.delete(filename) if File.symlink?(filename)
+       # needed for js/venn.js/venn.js
+       FileUtils.rm_rf(filename) if File.directory?(filename)
+    end
+
   end
 
 end
